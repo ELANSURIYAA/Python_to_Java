@@ -1,0 +1,382 @@
+import java.io.*;
+import java.net.http.*;
+import java.net.URI;
+import java.nio.file.*;
+import java.util.*;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.core.type.TypeReference;
+import javax.net.ssl.*;
+import java.security.cert.X509Certificate;
+
+/**
+ * Databricks Dashboard Upload & Schedule Setup
+ * Java equivalent of the Python dashboardscheduler module
+ */
+public class DatabricksDashboardUploader {
+    
+    // Configuration constants
+    private static final String DATABRICKS_INSTANCE = "your-databricks-instance";
+    private static final String TOKEN = "your-databricks-token";
+    private static final String LVDASH_FILE_PATH = "C:\\Users\\username\\Downloads\\dashboard_file.json";
+    
+    // Databricks API endpoints
+    private static final String BASE_URL = String.format("https://%s.cloud.databricks.com/api/2.0", DATABRICKS_INSTANCE);
+    private static final String LAKEVIEW_API = String.format("https://%s.cloud.databricks.com/api/2.0/lakeview", DATABRICKS_INSTANCE);
+    
+    // Instance variables
+    private String instance;
+    private String token;
+    private Map<String, String> headers;
+    private HttpClient httpClient;
+    private ObjectMapper objectMapper;
+    
+    /**
+     * Constructor for DatabricksDashboardUploader
+     * @param instance Databricks instance name
+     * @param token Authentication token
+     */
+    public DatabricksDashboardUploader(String instance, String token) {
+        this.instance = instance;
+        this.token = token;
+        this.headers = new HashMap<>();
+        this.headers.put("Authorization", "Bearer " + token);
+        this.headers.put("Content-Type", "application/json");
+        
+        // Initialize HTTP client with SSL trust all (equivalent to verify=False in Python)
+        this.httpClient = HttpClient.newBuilder()
+            .sslContext(createTrustAllSSLContext())
+            .build();
+        
+        this.objectMapper = new ObjectMapper();
+    }
+    
+    /**
+     * Create SSL context that trusts all certificates (equivalent to verify=False)
+     */
+    private SSLContext createTrustAllSSLContext() {
+        try {
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(null, new TrustManager[]{new X509TrustManager() {
+                public X509Certificate[] getAcceptedIssuers() { return null; }
+                public void checkClientTrusted(X509Certificate[] certs, String authType) {}
+                public void checkServerTrusted(X509Certificate[] certs, String authType) {}
+            }}, null);
+            return sslContext;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create SSL context", e);
+        }
+    }
+    
+    /**
+     * Read and parse the LVDash JSON file
+     * @param filePath Path to the LVDash file
+     * @return Map containing dashboard data
+     * @throws Exception if file reading or parsing fails
+     */
+    public Map<String, Object> readLvdashFile(String filePath) throws Exception {
+        try {
+            // Check if file exists (equivalent to os.path.exists)
+            if (!Files.exists(Paths.get(filePath))) {
+                throw new FileNotFoundException("File not found: " + filePath);
+            }
+            
+            // Read file content
+            String content = Files.readString(Paths.get(filePath));
+            
+            // Parse JSON (equivalent to json.load)
+            Map<String, Object> dashboardData = objectMapper.readValue(content, 
+                new TypeReference<Map<String, Object>>() {});
+            
+            System.out.println("✓ Successfully read LVDash file: " + filePath);
+            return dashboardData;
+            
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new Exception("Invalid JSON format in LVDash file: " + e.getMessage());
+        } catch (Exception e) {
+            throw new Exception("Error reading LVDash file: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Create/Upload dashboard to Databricks
+     * @param dashboardData Dashboard configuration data
+     * @return Dashboard ID
+     * @throws Exception if dashboard creation fails
+     */
+    public String createDashboard(Map<String, Object> dashboardData) throws Exception {
+        try {
+            // Extract dashboard name from data or use default
+            String dashboardName = (String) dashboardData.getOrDefault("displayName", "HPX_Executive_Summary");
+            
+            // Prepare the payload for dashboard creation
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("display_name", dashboardName);
+            payload.put("serialized_dashboard", objectMapper.writeValueAsString(dashboardData));
+            payload.put("parent_path", "/Workspace/Users/username@company.com/ThoughtspotLvdash/Output");
+            
+            String url = LAKEVIEW_API + "/dashboards";
+            
+            System.out.println("Uploading dashboard '" + dashboardName + "' to Databricks...");
+            
+            // Create HTTP request
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", headers.get("Authorization"))
+                .header("Content-Type", headers.get("Content-Type"))
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(payload)))
+                .build();
+            
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            
+            if (response.statusCode() == 200 || response.statusCode() == 201) {
+                Map<String, Object> result = objectMapper.readValue(response.body(), 
+                    new TypeReference<Map<String, Object>>() {});
+                String dashboardId = (String) result.get("dashboard_id");
+                
+                System.out.println("✓ Dashboard uploaded successfully!");
+                System.out.println("  Dashboard ID: " + dashboardId);
+                System.out.println("  Dashboard Name: " + dashboardName);
+                return dashboardId;
+            } else {
+                String errorMsg = parseErrorResponse(response);
+                throw new Exception("Failed to upload dashboard: " + errorMsg);
+            }
+            
+        } catch (Exception e) {
+            if (e.getMessage().contains("Network") || e.getMessage().contains("Connection")) {
+                throw new Exception("Network error during dashboard upload: " + e.getMessage());
+            }
+            throw new Exception("Error creating dashboard: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Publish the dashboard
+     * @param dashboardId ID of the dashboard to publish
+     * @return true if successful, false otherwise
+     */
+    public boolean publishDashboard(String dashboardId) {
+        try {
+            String url = LAKEVIEW_API + "/dashboards/" + dashboardId + "/published";
+            
+            System.out.println("Publishing dashboard " + dashboardId + "...");
+            
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", headers.get("Authorization"))
+                .header("Content-Type", headers.get("Content-Type"))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+            
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            
+            if (response.statusCode() == 200 || response.statusCode() == 204) {
+                System.out.println("✓ Dashboard published successfully!");
+                return true;
+            } else {
+                String errorMsg = parseErrorResponse(response);
+                System.out.println("⚠ Warning: Could not publish dashboard: " + errorMsg);
+                return false;
+            }
+            
+        } catch (Exception e) {
+            System.out.println("⚠ Warning: Error publishing dashboard: " + e.getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Create a schedule for dashboard refresh
+     * @param dashboardId ID of the dashboard
+     * @param cronSchedule Cron expression for scheduling (default: "0 8 * * *")
+     * @return Schedule ID
+     * @throws Exception if schedule creation fails
+     */
+    public String createSchedule(String dashboardId, String cronSchedule) throws Exception {
+        if (cronSchedule == null) {
+            cronSchedule = "0 8 * * *"; // Default value
+        }
+        
+        try {
+            // Create nested schedule object
+            Map<String, Object> scheduleConfig = new HashMap<>();
+            scheduleConfig.put("quartz_cron_expression", cronSchedule);
+            scheduleConfig.put("timezone_id", "UTC");
+            
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("dashboard_id", dashboardId);
+            payload.put("display_name", "Daily Refresh - " + dashboardId);
+            payload.put("pause_status", "UNPAUSED");
+            payload.put("schedule", scheduleConfig);
+            
+            String url = LAKEVIEW_API + "/dashboards/" + dashboardId + "/schedules";
+            
+            System.out.println("Creating schedule for dashboard (cron: " + cronSchedule + ")...");
+            
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", headers.get("Authorization"))
+                .header("Content-Type", headers.get("Content-Type"))
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(payload)))
+                .build();
+            
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            
+            if (response.statusCode() == 200 || response.statusCode() == 201) {
+                Map<String, Object> result = objectMapper.readValue(response.body(), 
+                    new TypeReference<Map<String, Object>>() {});
+                String scheduleId = (String) result.get("schedule_id");
+                
+                System.out.println("✓ Schedule created successfully!");
+                System.out.println("  Schedule ID: " + scheduleId);
+                System.out.println("  Cron Expression: " + cronSchedule);
+                return scheduleId;
+            } else {
+                String errorMsg = parseErrorResponse(response);
+                throw new Exception("Failed to create schedule: " + errorMsg);
+            }
+            
+        } catch (Exception e) {
+            if (e.getMessage().contains("Network") || e.getMessage().contains("Connection")) {
+                throw new Exception("Network error during schedule creation: " + e.getMessage());
+            }
+            throw new Exception("Error creating schedule: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Parse error response from Databricks API
+     * @param response HTTP response object
+     * @return Formatted error message
+     */
+    private String parseErrorResponse(HttpResponse<String> response) {
+        try {
+            Map<String, Object> errorData = objectMapper.readValue(response.body(), 
+                new TypeReference<Map<String, Object>>() {});
+            String errorCode = (String) errorData.getOrDefault("error_code", "UNKNOWN_ERROR");
+            String errorMessage = (String) errorData.getOrDefault("message", response.body());
+            return String.format("[%d] %s: %s", response.statusCode(), errorCode, errorMessage);
+        } catch (Exception e) {
+            return String.format("[%d] %s", response.statusCode(), response.body());
+        }
+    }
+    
+    /**
+     * Generate dashboard URL
+     * @param dashboardId ID of the dashboard
+     * @return Complete dashboard URL
+     */
+    public String getDashboardUrl(String dashboardId) {
+        return String.format("https://%s.cloud.databricks.com/sql/dashboards/%s", 
+            this.instance, dashboardId);
+    }
+    
+    /**
+     * Main execution function
+     */
+    public static void main(String[] args) {
+        System.out.println("=".repeat(70));
+        System.out.println("Databricks Dashboard Upload & Schedule Setup");
+        System.out.println("=".repeat(70));
+        System.out.println();
+        
+        try {
+            // Initialize uploader
+            DatabricksDashboardUploader uploader = new DatabricksDashboardUploader(DATABRICKS_INSTANCE, TOKEN);
+            
+            // Step 1: Read LVDash file
+            System.out.println("Step 1: Reading LVDash file...");
+            Map<String, Object> dashboardData = uploader.readLvdashFile(LVDASH_FILE_PATH);
+            System.out.println();
+            
+            // Step 2: Upload dashboard
+            System.out.println("Step 2: Uploading dashboard to Databricks...");
+            String dashboardId = uploader.createDashboard(dashboardData);
+            System.out.println();
+            
+            // Step 3: Publish dashboard
+            System.out.println("Step 3: Publishing dashboard...");
+            uploader.publishDashboard(dashboardId);
+            System.out.println();
+            
+            // Step 4: Create schedule (runs daily at 8 AM UTC)
+            System.out.println("Step 4: Creating dashboard schedule...");
+            String cronSchedule = "0 8 * * *";  // Daily at 8 AM UTC
+            // Change to "0 */4 * * *" for every 4 hours
+            // Change to "0 0 * * 1" for every Monday at midnight
+            String scheduleId = uploader.createSchedule(dashboardId, cronSchedule);
+            System.out.println();
+            
+            // Success summary
+            System.out.println("=".repeat(70));
+            System.out.println("✓ ALL STEPS COMPLETED SUCCESSFULLY!");
+            System.out.println("=".repeat(70));
+            System.out.println("Dashboard ID: " + dashboardId);
+            System.out.println("Schedule ID: " + scheduleId);
+            System.out.println("Dashboard URL: " + uploader.getDashboardUrl(dashboardId));
+            System.out.println();
+            System.out.println("Next steps:");
+            System.out.println("1. Visit the dashboard URL above to view your dashboard");
+            System.out.println("2. The dashboard will refresh automatically based on the schedule");
+            System.out.println("3. You can modify the schedule in Databricks UI if needed");
+            System.out.println("=".repeat(70));
+            
+        } catch (FileNotFoundException e) {
+            System.out.println("\n❌ FILE ERROR: " + e.getMessage());
+            System.out.println("\nPlease check:");
+            System.out.println("1. The file path is correct");
+            System.out.println("2. The file exists at the specified location");
+            System.out.println("3. You have read permissions for the file");
+            
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            System.out.println("\n❌ JSON PARSING ERROR: " + e.getMessage());
+            System.out.println("\nPlease check:");
+            System.out.println("1. The LVDash file contains valid JSON");
+            System.out.println("2. The file is not corrupted");
+            System.out.println("3. The file is a proper Databricks LVDash export");
+            
+        } catch (java.net.ConnectException e) {
+            System.out.println("\n❌ CONNECTION ERROR: " + e.getMessage());
+            System.out.println("\nPlease check:");
+            System.out.println("1. Your internet connection is active");
+            System.out.println("2. The Databricks instance URL is correct");
+            System.out.println("3. You can access Databricks from your network");
+            
+        } catch (Exception e) {
+            System.out.println("\n❌ ERROR: " + e.getMessage());
+            System.out.println("\nPlease check:");
+            System.out.println("1. Your Databricks token is valid and not expired");
+            System.out.println("2. You have permissions to create dashboards and schedules");
+            System.out.println("3. The Databricks instance name is correct");
+            System.out.println("4. The LVDash file format is compatible with your Databricks version");
+            System.out.println("\nFull error details:");
+            e.printStackTrace();
+        }
+    }
+}
+
+/*
+ * Required Maven Dependencies:
+ * 
+ * <dependencies>
+ *     <dependency>
+ *         <groupId>com.fasterxml.jackson.core</groupId>
+ *         <artifactId>jackson-databind</artifactId>
+ *         <version>2.15.2</version>
+ *     </dependency>
+ * </dependencies>
+ * 
+ * Note: This Java code requires Java 11+ for HttpClient and Files.readString() methods.
+ * For older Java versions, use Apache HttpClient and alternative file reading methods.
+ * 
+ * CONVERSION NOTES:
+ * - Python requests library → Java HttpClient (Java 11+)
+ * - Python json module → Jackson ObjectMapper
+ * - Python os.path.exists() → Java Files.exists()
+ * - Python f-strings → Java String.format() or concatenation
+ * - Python dict → Java Map<String, Object>
+ * - Python try/except → Java try/catch
+ * - Python print() → Java System.out.println()
+ * - Python urllib3.disable_warnings() → Custom SSL context in Java
+ * - Python default parameters → Java method overloading or null checks
+ */
